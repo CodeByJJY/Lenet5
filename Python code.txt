@@ -1,0 +1,119 @@
+import os
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import numpy as np
+
+
+def build_lenet5():
+    """LeNet-5 구조 정의 (ZeroPadding 포함)."""
+    model = models.Sequential([
+        layers.ZeroPadding2D(padding=2, input_shape=(28, 28, 1)),
+        layers.Conv2D(6, (5, 5), activation='relu'),
+        layers.AveragePooling2D((2, 2)),
+        layers.Conv2D(16, (5, 5), activation='relu'),
+        layers.AveragePooling2D((2, 2)),
+        layers.Flatten(),
+        layers.Dense(120, activation='relu'),
+        layers.Dense(84, activation='relu'),
+        layers.Dense(10, activation='softmax')
+    ])
+    return model
+
+
+def load_data():
+    """MNIST 데이터 로드 (정규화 제거)."""
+    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+    # float32로 변환하되, 255로 나누지 않음
+    x_train = x_train.astype(np.float32)
+    x_test  = x_test.astype(np.float32)
+
+    # 채널 차원 추가 (28,28,1)
+    x_train = np.expand_dims(x_train, axis=-1)
+    x_test  = np.expand_dims(x_test, axis=-1)
+    return (x_train, y_train), (x_test, y_test)
+
+
+def quantize(value, bits=8, frac_bits=4):
+    """양자화 (학습 후 정수 변환용)."""
+    scale = 2 ** frac_bits
+    q = np.round(value * scale)
+    q = np.clip(q, -(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
+    dtype = np.int8 if bits == 8 else np.int16
+    return q.astype(dtype)
+
+
+def flatten_conv_row_col_in_out(w_q):
+    """Conv2D weight flatten 순서: row → col → in_ch → out_ch"""
+    trans = np.transpose(w_q, (3, 2, 1, 0))
+    return trans.flatten()
+
+
+def flatten_dense_in_out(w_q):
+    """Dense weight flatten 순서: in_dim → out_dim"""
+    trans = np.transpose(w_q, (1, 0))
+    return trans.flatten()
+
+
+def train_and_save_weights(model, x_train, y_train, x_test, y_test,
+                           quant_bits=8, frac_bits=4):
+    """모델 학습 및 weight/bias 정수로 저장."""
+    model.compile(optimizer='adam',
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    model.fit(x_train, y_train, epochs=5, validation_data=(x_test, y_test))
+    test_loss, test_acc = model.evaluate(x_test, y_test)
+    print(f"Test Accuracy (Python): {test_acc:.4f}")
+
+    # weight/bias quantization + 저장
+    for layer in model.layers:
+        if isinstance(layer, layers.Conv2D):
+            w, b = layer.get_weights()
+            w_q = quantize(w, quant_bits, frac_bits)
+            b_q = quantize(b, quant_bits, frac_bits)
+            w_flat = flatten_conv_row_col_in_out(w_q)
+            np.savetxt(f"{layer.name}_weights.txt", w_flat, fmt='%d')
+            np.savetxt(f"{layer.name}_biases.txt",  b_q, fmt='%d')
+            print(f"[Saved] Conv2D '{layer.name}' weights/biases saved.")
+
+        elif isinstance(layer, layers.Dense):
+            w, b = layer.get_weights()
+            w_q = quantize(w, quant_bits, frac_bits)
+            b_q = quantize(b, quant_bits, frac_bits)
+            w_flat = flatten_dense_in_out(w_q)
+            np.savetxt(f"{layer.name}_weights.txt", w_flat, fmt='%d')
+            np.savetxt(f"{layer.name}_biases.txt",  b_q, fmt='%d')
+            print(f"[Saved] Dense '{layer.name}' weights/biases saved.")
+
+    print("All layer weights and biases saved.")
+    return test_acc
+
+
+def save_test_data(x_test, y_test, limit=1000):
+    """테스트 이미지를 개별 파일로 저장 (0~255 그대로)."""
+    x_test = x_test[:limit]
+    y_test = y_test[:limit]
+
+    img_dir = "images"
+    lbl_dir = "labels"
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(lbl_dir, exist_ok=True)
+
+    x_flat = x_test.reshape(x_test.shape[0], -1).astype(np.uint8)
+    y_int  = y_test.astype(np.int32).reshape(-1)
+
+    for i, (img_vec, label) in enumerate(zip(x_flat, y_int)):
+        idx = f"{i:03d}"
+        img_path = os.path.join(img_dir, f"img_{idx}.txt")
+        lbl_path = os.path.join(lbl_dir, f"label_{idx}.txt")
+        np.savetxt(img_path, img_vec[np.newaxis, :], fmt='%d')
+        np.savetxt(lbl_path, np.array([label], dtype=np.int32), fmt='%d')
+
+    print(f"Saved {len(x_flat)} images to '{img_dir}/' and labels to '{lbl_dir}/'.")
+
+
+if __name__ == "__main__":
+    (x_train, y_train), (x_test, y_test) = load_data()
+    model = build_lenet5()
+    python_accuracy = train_and_save_weights(model, x_train, y_train, x_test, y_test)
+    save_test_data(x_test, y_test)
